@@ -1,18 +1,16 @@
 package main
 
 import (
+	"container/ring"
 	"crypto/aes"
 	"encoding/binary"
 	"encoding/hex"
 	"golang.org/x/net/ipv4"
 	"log"
 	"net"
+	"net/http"
 	"os"
-)
-
-const (
-	srvAddr         = "236.5.19.10:11480"
-	maxDatagramSize = 1024
+	"sync"
 )
 
 var lastRTPSeq uint16 = 0
@@ -21,9 +19,13 @@ var pmtPid uint16
 var pmtPidFound = false
 var ecmPid uint16
 var ecmPidFound = false
-var masterKey = "5cfe2935886043e8799431571e4d9242"
+var masterKey = "09ce6d566f42302278a4b8121d6a4c74"
 var aes_key_1 []byte
 var aes_key_2 []byte
+
+var mu sync.Mutex
+var buf = ring.New(50)
+var c = sync.NewCond(&mu)
 
 func parseRTP(pkt []byte) []byte {
 	version := pkt[0] >> 6
@@ -145,7 +147,13 @@ func processPacket(pkt []byte) {
 		processECM(pkt)
 	}
 	decodePacket(pkt)
-	savePacket(pkt)
+
+	mu.Lock()
+	buf.Value = pkt
+	buf = buf.Next()
+	c.Broadcast()
+	mu.Unlock()
+	//savePacket(pkt)
 	//log.Printf("% x\n", pkt)
 }
 
@@ -159,16 +167,14 @@ func parsePayload(pkt []byte) {
 	}
 }
 
-func main() {
+func vmdecrypt() {
 	eth1, err := net.InterfaceByName("eth1")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	group := net.IPv4(236, 5, 22, 49)
-	//group := net.IPv4(236, 5, 19, 10)
 	c, err := net.ListenPacket("udp4", "0.0.0.0:15072")
-	//c, err := net.ListenPacket("udp4", "0.0.0.0:11480")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -179,9 +185,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pkt := make([]byte, 1500)
-
 	for {
+		pkt := make([]byte, 1500)
 		n, _, _, err := p.ReadFrom(pkt)
 		if err != nil {
 			log.Fatal(err)
@@ -191,4 +196,28 @@ func main() {
 	}
 	//log.Println(n, "bytes read from", src)
 	//log.Printf("% x", b[:n])
+}
+
+func httpHandler(w http.ResponseWriter, req *http.Request) {
+	mu.Lock()
+	ptr := buf
+	mu.Unlock()
+
+	log.Println("Serving client ...")
+	for {
+		mu.Lock()
+		for ptr == buf {
+			c.Wait()
+		}
+		val := ptr.Value
+		ptr = ptr.Next()
+		mu.Unlock()
+		w.Write(val.([]byte))
+	}
+}
+
+func main() {
+	go vmdecrypt()
+	http.HandleFunc("/", httpHandler)
+	log.Fatal(http.ListenAndServe(":8090", nil))
 }
