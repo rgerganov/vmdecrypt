@@ -60,7 +60,7 @@ func (ch *Channel) parseRTP(pkt []byte) []byte {
 		ch.firstPkt = false
 	}
 	if ch.lastRTPSeq+1 != seq {
-		log.Fatal("RTP discontinuity detected")
+		log.Println("RTP discontinuity detected")
 	}
 	ch.lastRTPSeq = seq
 	extSize := 0
@@ -125,6 +125,24 @@ func savePacket(pkt []byte) {
 	}
 }
 
+func (ch *Channel) parseEcmPid(desc []byte) {
+	//log.Printf("% x\n", desc)
+	for len(desc) > 0 {
+		tag := desc[0]
+		length := desc[1]
+		if tag == 0x09 {
+			caid := binary.BigEndian.Uint16(desc[2:4])
+			if caid == 0x5601 {
+				ch.ecmPid = binary.BigEndian.Uint16(desc[4:6])
+				ch.ecmPidFound = true
+				return
+			}
+		}
+		desc = desc[2+length:]
+	}
+	log.Fatal("Cannot find ECM PID")
+}
+
 func (ch *Channel) processPacket(pkt []byte) {
 	if pkt[0] != 0x47 {
 		log.Fatal("Expected sync byte")
@@ -150,15 +168,8 @@ func (ch *Channel) processPacket(pkt []byte) {
 		if pkt[5] != 2 {
 			log.Fatal("Unexpected PMT table ID", pkt[5])
 		}
-		if pkt[16] != 6 {
-			log.Fatal("Unexpected program info length", pkt[16])
-		}
-		caid := binary.BigEndian.Uint16(pkt[19:21])
-		if caid != 0x5601 {
-			log.Fatal("Unexpected CAID", caid)
-		}
-		ch.ecmPid = binary.BigEndian.Uint16(pkt[21:23])
-		ch.ecmPidFound = true
+		piLength := binary.BigEndian.Uint16(pkt[15:17]) & 0x03ff
+		ch.parseEcmPid(pkt[17 : 17+piLength])
 		log.Printf("ECM pid=0x%x", ch.ecmPid)
 	}
 	if ch.ecmPidFound && pid == ch.ecmPid {
