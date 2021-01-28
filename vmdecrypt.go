@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -199,14 +200,15 @@ func (ch *Channel) nextPtr(ptr *ring.Ring) (*ring.Ring, interface{}) {
 	return ptr.Next(), ptr.Value
 }
 
-func vmdecrypt(ch *Channel) {
+func vmdecrypt(ch *Channel, hostPort string) {
 	eth1, err := net.InterfaceByName("eth1")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	group := net.IPv4(236, 5, 22, 49)
-	c, err := net.ListenPacket("udp4", "0.0.0.0:15072")
+	host, _, _ := net.SplitHostPort(hostPort)
+	group := net.ParseIP(host)
+	c, err := net.ListenPacket("udp4", hostPort)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -217,7 +219,7 @@ func vmdecrypt(ch *Channel) {
 		log.Fatal(err)
 	}
 
-	log.Println("Start decrypting channel ...")
+	log.Println("Start decrypting channel @", hostPort)
 loop:
 	for {
 		select {
@@ -234,21 +236,36 @@ loop:
 		payload := ch.parseRTP(pkt[:n])
 		ch.parsePayload(payload)
 	}
-	log.Println("Stopped decrypting channel")
+	log.Println("Stopped decrypting channel @", hostPort)
 	p.LeaveGroup(eth1, &net.UDPAddr{IP: group})
 	ch.done <- true
-	//log.Println(n, "bytes read from", src)
-	//log.Printf("% x", b[:n])
 }
 
 func httpHandler(w http.ResponseWriter, req *http.Request) {
+	// requestURI should be /rtp/236.5.22.49:15072/48a028403963ae6bb8a26ec85677567e
+	parts := strings.Split(req.RequestURI[5:], "/")
+	if len(parts) != 2 {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	hostPort := parts[0]
+	if _, _, err := net.SplitHostPort(hostPort); err != nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	masterKey := parts[1]
+	if _, err := hex.DecodeString(masterKey); err != nil || len(masterKey) != 32 {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
 	channelMapMu.Lock()
-	chInfo, ok := channelMap["btv"]
+	chInfo, ok := channelMap[hostPort]
 	if !ok {
-		ch := newChannel("48a028403963ae6bb8a26ec85677567e")
+		ch := newChannel(masterKey)
 		chInfo = &ChannelInfo{ch: ch, numClients: 1}
-		channelMap["btv"] = chInfo
-		go vmdecrypt(ch)
+		channelMap[hostPort] = chInfo
+		go vmdecrypt(ch, hostPort)
 	} else {
 		chInfo.numClients += 1
 	}
@@ -268,13 +285,13 @@ func httpHandler(w http.ResponseWriter, req *http.Request) {
 
 	log.Println("Stop serving client")
 	channelMapMu.Lock()
-	chInfo, ok = channelMap["btv"]
+	chInfo, ok = channelMap[hostPort]
 	if ok {
 		chInfo.numClients -= 1
 		if chInfo.numClients == 0 {
 			chInfo.ch.done <- true
 			<-chInfo.ch.done
-			delete(channelMap, "btv")
+			delete(channelMap, hostPort)
 		}
 	}
 	channelMapMu.Unlock()
@@ -282,6 +299,6 @@ func httpHandler(w http.ResponseWriter, req *http.Request) {
 
 func main() {
 	channelMap = make(map[string]*ChannelInfo)
-	http.HandleFunc("/", httpHandler)
+	http.HandleFunc("/rtp/", httpHandler)
 	log.Fatal(http.ListenAndServe(":8090", nil))
 }
