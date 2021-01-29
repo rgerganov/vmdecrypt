@@ -5,6 +5,8 @@ import (
 	"crypto/aes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"golang.org/x/net/ipv4"
 	"log"
 	"net"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Channel struct {
@@ -28,6 +31,7 @@ type Channel struct {
 	buf         *ring.Ring
 	c           *sync.Cond
 	done        chan bool
+	ioerr       bool
 }
 
 type ChannelInfo struct {
@@ -48,10 +52,10 @@ func newChannel(masterKey string) *Channel {
 	return &ch
 }
 
-func (ch *Channel) parseRTP(pkt []byte) []byte {
+func (ch *Channel) parseRTP(pkt []byte) ([]byte, error) {
 	version := pkt[0] >> 6
 	if version != 2 {
-		log.Fatal("Unexpected RTP version ", version)
+		return nil, fmt.Errorf("Unexpected RTP version %v", version)
 	}
 	hasExtension := (pkt[0] >> 4) & 1
 	seq := binary.BigEndian.Uint16(pkt[2:4])
@@ -67,21 +71,18 @@ func (ch *Channel) parseRTP(pkt []byte) []byte {
 	if hasExtension > 0 {
 		extSize = 4 + int(binary.BigEndian.Uint16(pkt[14:16])*4)
 	}
-	return pkt[12+extSize:]
+	return pkt[12+extSize:], nil
 }
 
-func (ch *Channel) processECM(pkt []byte) {
-	key, err := hex.DecodeString(ch.masterKey)
-	if err != nil {
-		log.Fatal(err)
-	}
+func (ch *Channel) processECM(pkt []byte) error {
+	key, _ := hex.DecodeString(ch.masterKey)
 	cipher, _ := aes.NewCipher([]byte(key))
 	ecm := make([]byte, 64)
 	for i := 0; i < 4; i++ {
 		cipher.Decrypt(ecm[i*16:], pkt[29+i*16:])
 	}
 	if ecm[0] != 0x43 || ecm[1] != 0x45 || ecm[2] != 0x42 {
-		log.Fatal("Error decrypting ECM")
+		return errors.New("Error decrypting ECM")
 	}
 	if pkt[5] == 0x81 {
 		ch.aes_key_1 = ecm[9 : 9+16]
@@ -90,6 +91,7 @@ func (ch *Channel) processECM(pkt []byte) {
 		ch.aes_key_2 = ecm[9 : 9+16]
 		ch.aes_key_1 = ecm[25 : 25+16]
 	}
+	return nil
 }
 
 func (ch *Channel) decodePacket(pkt []byte) {
@@ -125,7 +127,7 @@ func savePacket(pkt []byte) {
 	}
 }
 
-func (ch *Channel) parseEcmPid(desc []byte) {
+func (ch *Channel) parseEcmPid(desc []byte) error {
 	//log.Printf("% x\n", desc)
 	for len(desc) > 0 {
 		tag := desc[0]
@@ -135,65 +137,76 @@ func (ch *Channel) parseEcmPid(desc []byte) {
 			if caid == 0x5601 {
 				ch.ecmPid = binary.BigEndian.Uint16(desc[4:6])
 				ch.ecmPidFound = true
-				return
+				//log.Printf("ECM pid=0x%x", ch.ecmPid)
+				return nil
 			}
 		}
 		desc = desc[2+length:]
 	}
-	log.Fatal("Cannot find ECM PID")
+	return errors.New("Cannot find ECM PID")
 }
 
-func (ch *Channel) processPacket(pkt []byte) {
+func (ch *Channel) processPacket(pkt []byte) error {
 	if pkt[0] != 0x47 {
-		log.Fatal("Expected sync byte")
+		return fmt.Errorf("Expected sync byte but got: %v", pkt[0])
 	}
 	pid := binary.BigEndian.Uint16(pkt[1:3]) & 0x1fff
 	if !ch.pmtPidFound && pid == 0 {
 		// process PAT
 		if pkt[4] != 0 {
-			log.Fatal("Pointer fields are not supported yet")
+			return errors.New("[PAT] Pointer fields are not supported yet")
 		}
 		if pkt[5] != 0 {
-			log.Fatal("Unexpected PAT table ID", pkt[5])
+			return fmt.Errorf("Unexpected PAT table ID: %v", pkt[5])
 		}
 		ch.pmtPid = binary.BigEndian.Uint16(pkt[15:17]) & 0x1fff
 		ch.pmtPidFound = true
-		log.Printf("PMT pid=0x%x", ch.pmtPid)
+		//log.Printf("PMT pid=0x%x", ch.pmtPid)
 	}
 	if !ch.ecmPidFound && ch.pmtPidFound && pid == ch.pmtPid {
 		// process PMT
 		if pkt[4] != 0 {
-			log.Fatal("Pointer fields are not supported yet")
+			return errors.New("[PMT] Pointer fields are not supported yet")
 		}
 		if pkt[5] != 2 {
-			log.Fatal("Unexpected PMT table ID", pkt[5])
+			return fmt.Errorf("Unexpected PMT table ID: %v", pkt[5])
 		}
 		piLength := binary.BigEndian.Uint16(pkt[15:17]) & 0x03ff
-		ch.parseEcmPid(pkt[17 : 17+piLength])
-		log.Printf("ECM pid=0x%x", ch.ecmPid)
+		if err := ch.parseEcmPid(pkt[17 : 17+piLength]); err != nil {
+			return err
+		}
 	}
 	if ch.ecmPidFound && pid == ch.ecmPid {
-		ch.processECM(pkt)
+		if err := ch.processECM(pkt); err != nil {
+			return err
+		}
 	}
 	ch.decodePacket(pkt)
-
-	ch.mu.Lock()
-	ch.buf.Value = pkt
-	ch.buf = ch.buf.Next()
-	ch.c.Broadcast()
-	ch.mu.Unlock()
+	ch.addToBuf(pkt)
+	return nil
 	//savePacket(pkt)
 	//log.Printf("% x\n", pkt)
 }
 
-func (ch *Channel) parsePayload(pkt []byte) {
+func (ch *Channel) parseRTPPayload(pkt []byte) error {
 	if len(pkt)%188 != 0 {
-		log.Fatal("Unexpected length")
+		return fmt.Errorf("Unexpected RTP payload length: %v", len(pkt))
 	}
 	for len(pkt) > 0 {
-		ch.processPacket(pkt[:188])
+		if err := ch.processPacket(pkt[:188]); err != nil {
+			return err
+		}
 		pkt = pkt[188:]
 	}
+	return nil
+}
+
+func (ch *Channel) addToBuf(val interface{}) {
+	ch.mu.Lock()
+	ch.buf.Value = val
+	ch.buf = ch.buf.Next()
+	ch.c.Broadcast()
+	ch.mu.Unlock()
 }
 
 func (ch *Channel) currentPtr() *ring.Ring {
@@ -205,10 +218,21 @@ func (ch *Channel) currentPtr() *ring.Ring {
 func (ch *Channel) nextPtr(ptr *ring.Ring) (*ring.Ring, interface{}) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	for ptr == ch.buf {
+	for ptr == ch.buf && !ch.ioerr {
 		ch.c.Wait()
 	}
-	return ptr.Next(), ptr.Value
+	if !ch.ioerr {
+		return ptr.Next(), ptr.Value
+	} else {
+		return ptr, nil
+	}
+}
+
+func (ch *Channel) closeBuf() {
+	ch.mu.Lock()
+	ch.ioerr = true
+	ch.c.Broadcast()
+	ch.mu.Unlock()
 }
 
 func vmdecrypt(ch *Channel, hostPort string) {
@@ -227,29 +251,48 @@ func vmdecrypt(ch *Channel, hostPort string) {
 
 	p := ipv4.NewPacketConn(c)
 	if err := p.JoinGroup(eth1, &net.UDPAddr{IP: group}); err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		goto ioerr
 	}
+	defer p.LeaveGroup(eth1, &net.UDPAddr{IP: group})
 
 	log.Println("Start decrypting channel @", hostPort)
-loop:
 	for {
 		select {
 		case <-ch.done:
-			break loop
+			goto noclients
 		default:
 			// do nothing
 		}
 		pkt := make([]byte, 1500)
+		p.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, _, _, err := p.ReadFrom(pkt)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
 		}
-		payload := ch.parseRTP(pkt[:n])
-		ch.parsePayload(payload)
+		payload, err := ch.parseRTP(pkt[:n])
+		if err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
+		if err := ch.parseRTPPayload(payload); err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
 	}
-	log.Println("Stopped decrypting channel @", hostPort)
-	p.LeaveGroup(eth1, &net.UDPAddr{IP: group})
+noclients:
+	log.Println("No more clients, stop decrypting channel @", hostPort)
 	ch.done <- true
+	log.Println("Done @", hostPort)
+	return
+
+ioerr:
+	log.Println("I/O error, stop decrypting channel @", hostPort)
+	ch.closeBuf()
+	<-ch.done
+	ch.done <- true
+	log.Println("Done @", hostPort)
 }
 
 func httpHandler(w http.ResponseWriter, req *http.Request) {
@@ -283,18 +326,21 @@ func httpHandler(w http.ResponseWriter, req *http.Request) {
 	channelMapMu.Unlock()
 
 	ch := chInfo.ch
-	log.Println("Start serving client")
+	log.Println("Start serving client", req.RemoteAddr)
 	ptr := ch.currentPtr()
 	var val interface{}
 	for {
 		ptr, val = ch.nextPtr(ptr)
+		if val == nil {
+			break
+		}
 		_, err := w.Write(val.([]byte))
 		if err != nil {
 			break
 		}
 	}
 
-	log.Println("Stop serving client")
+	log.Println("Stop serving client", req.RemoteAddr)
 	channelMapMu.Lock()
 	chInfo, ok = channelMap[hostPort]
 	if ok {
