@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -359,7 +361,6 @@ func rtpHandler(w http.ResponseWriter, req *http.Request) {
 
 func chHandler(w http.ResponseWriter, req *http.Request) {
 	chName := req.RequestURI[4:]
-	log.Println(chName)
 	if chInfo, ok := channels[chName]; ok {
 		channelHandler(chInfo, w, req)
 	} else {
@@ -375,12 +376,28 @@ func fetchChannels(chURL string) {
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	log.Println(body)
-	//err := json.Unmarshal(body, &chKeys)
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
-	//log.Println(chKeys.date)
+	var f interface{}
+	err = json.Unmarshal(body, &f)
+	if err != nil {
+		log.Fatal(err)
+	}
+	m := f.(map[string]interface{})
+	chdate := m["date"]
+	all := m["channels"].([]interface{})
+	for _, c := range all {
+		v := c.([]interface{})
+		name := v[0].(string)
+		addr := v[1].(string)
+		switch key := v[2].(type) {
+		case string:
+			// strip "igmp://" from address
+			name = url.PathEscape(name)
+			channels[name] = ChannelInfo{addr[7:], key}
+		case float64:
+			// ignore
+		}
+	}
+	log.Printf("%d channels loaded, last updated on %s\n", len(channels), chdate)
 }
 
 func main() {
@@ -394,13 +411,12 @@ func main() {
 		fmt.Printf("No such network interface: %s\n", *ifname)
 		os.Exit(1)
 	}
+	channels = make(map[string]ChannelInfo)
 	if *chURL != "" {
 		fetchChannels(*chURL)
 	}
 
 	log.Printf("Starting HTTP server on port %d, multicast interface: %s\n", *port, *ifname)
-	channels = make(map[string]ChannelInfo)
-	channels["bTV%20HD"] = ChannelInfo{"236.5.22.49:15072", "0dad9bfa732a163baa1c711a22cb84af"}
 	runningChannels = make(map[string]*Channel)
 	http.HandleFunc("/rtp/", rtpHandler)
 	http.HandleFunc("/ch/", chHandler)
