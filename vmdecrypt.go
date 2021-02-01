@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"golang.org/x/net/ipv4"
 	"log"
@@ -43,6 +44,7 @@ const RingSize = 64
 
 var channelMapMu sync.Mutex
 var channelMap map[string]*ChannelInfo
+var ifi *net.Interface
 
 func newChannel(masterKey string) *Channel {
 	ch := Channel{firstPkt: true, masterKey: masterKey}
@@ -236,11 +238,6 @@ func (ch *Channel) closeBuf() {
 }
 
 func vmdecrypt(ch *Channel, hostPort string) {
-	eth1, err := net.InterfaceByName("eth1")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	host, _, _ := net.SplitHostPort(hostPort)
 	group := net.ParseIP(host)
 	c, err := net.ListenPacket("udp4", hostPort)
@@ -250,11 +247,11 @@ func vmdecrypt(ch *Channel, hostPort string) {
 	defer c.Close()
 
 	p := ipv4.NewPacketConn(c)
-	if err := p.JoinGroup(eth1, &net.UDPAddr{IP: group}); err != nil {
+	if err := p.JoinGroup(ifi, &net.UDPAddr{IP: group}); err != nil {
 		log.Println(err)
 		goto ioerr
 	}
-	defer p.LeaveGroup(eth1, &net.UDPAddr{IP: group})
+	defer p.LeaveGroup(ifi, &net.UDPAddr{IP: group})
 
 	log.Println("Start decrypting channel @", hostPort)
 	for {
@@ -355,7 +352,18 @@ func httpHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
+	ifname := flag.String("i", "eth0", "Multicast interface")
+	port := flag.Int("p", 8080, "Port number for HTTP")
+	flag.Parse()
+	var err error
+	ifi, err = net.InterfaceByName(*ifname)
+	if err != nil {
+		fmt.Printf("No such network interface: %s\n", *ifname)
+		os.Exit(1)
+	}
+
+	log.Printf("Starting HTTP server on port %d, multicast interface: %s\n", *port, *ifname)
 	channelMap = make(map[string]*ChannelInfo)
 	http.HandleFunc("/rtp/", httpHandler)
-	log.Fatal(http.ListenAndServe(":8090", nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
