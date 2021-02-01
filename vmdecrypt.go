@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/net/ipv4"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -33,21 +34,26 @@ type Channel struct {
 	c           *sync.Cond
 	done        chan bool
 	ioerr       bool
-}
-
-type ChannelInfo struct {
-	ch         *Channel
-	numClients int
+	numClients  int
 }
 
 const RingSize = 64
 
-var channelMapMu sync.Mutex
-var channelMap map[string]*ChannelInfo
+var runningChannelsMu sync.Mutex
+var runningChannels map[string]*Channel
+
 var ifi *net.Interface
 
+type ChannelInfo struct {
+	addr      string
+	masterKey string
+}
+
+// channel name => ChannelInfo
+var channels map[string]ChannelInfo
+
 func newChannel(masterKey string) *Channel {
-	ch := Channel{firstPkt: true, masterKey: masterKey}
+	ch := Channel{firstPkt: true, masterKey: masterKey, numClients: 1}
 	ch.buf = ring.New(RingSize)
 	ch.c = sync.NewCond(&ch.mu)
 	ch.done = make(chan bool)
@@ -292,37 +298,18 @@ ioerr:
 	log.Println("Done @", hostPort)
 }
 
-func httpHandler(w http.ResponseWriter, req *http.Request) {
-	// requestURI should be /rtp/236.5.22.49:15072/48a028403963ae6bb8a26ec85677567e
-	parts := strings.Split(req.RequestURI[5:], "/")
-	if len(parts) != 2 {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	hostPort := parts[0]
-	if _, _, err := net.SplitHostPort(hostPort); err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	masterKey := parts[1]
-	if _, err := hex.DecodeString(masterKey); err != nil || len(masterKey) != 32 {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	channelMapMu.Lock()
-	chInfo, ok := channelMap[hostPort]
+func channelHandler(chInfo ChannelInfo, w http.ResponseWriter, req *http.Request) {
+	runningChannelsMu.Lock()
+	ch, ok := runningChannels[chInfo.addr]
 	if !ok {
-		ch := newChannel(masterKey)
-		chInfo = &ChannelInfo{ch: ch, numClients: 1}
-		channelMap[hostPort] = chInfo
-		go vmdecrypt(ch, hostPort)
+		ch = newChannel(chInfo.masterKey)
+		runningChannels[chInfo.addr] = ch
+		go vmdecrypt(ch, chInfo.addr)
 	} else {
-		chInfo.numClients += 1
+		ch.numClients += 1
 	}
-	channelMapMu.Unlock()
+	runningChannelsMu.Unlock()
 
-	ch := chInfo.ch
 	log.Println("Start serving client", req.RemoteAddr)
 	ptr := ch.currentPtr()
 	var val interface{}
@@ -338,22 +325,68 @@ func httpHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.Println("Stop serving client", req.RemoteAddr)
-	channelMapMu.Lock()
-	chInfo, ok = channelMap[hostPort]
-	if ok {
-		chInfo.numClients -= 1
-		if chInfo.numClients == 0 {
-			chInfo.ch.done <- true
-			<-chInfo.ch.done
-			delete(channelMap, hostPort)
+	runningChannelsMu.Lock()
+	if ch, ok = runningChannels[chInfo.addr]; ok {
+		ch.numClients -= 1
+		if ch.numClients == 0 {
+			ch.done <- true
+			<-ch.done
+			delete(runningChannels, chInfo.addr)
 		}
 	}
-	channelMapMu.Unlock()
+	runningChannelsMu.Unlock()
+}
+
+func rtpHandler(w http.ResponseWriter, req *http.Request) {
+	// requestURI should be /rtp/236.5.22.49:15072/48a028403963ae6bb8a26ec85677567e
+	parts := strings.Split(req.RequestURI[5:], "/")
+	if len(parts) != 2 {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	addr := parts[0]
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	masterKey := parts[1]
+	if _, err := hex.DecodeString(masterKey); err != nil || len(masterKey) != 32 {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	channelHandler(ChannelInfo{addr, masterKey}, w, req)
+}
+
+func chHandler(w http.ResponseWriter, req *http.Request) {
+	chName := req.RequestURI[4:]
+	log.Println(chName)
+	if chInfo, ok := channels[chName]; ok {
+		channelHandler(chInfo, w, req)
+	} else {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+}
+
+func fetchChannels(chURL string) {
+	resp, err := http.Get(chURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
+	log.Println(body)
+	//err := json.Unmarshal(body, &chKeys)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//log.Println(chKeys.date)
 }
 
 func main() {
 	ifname := flag.String("i", "eth0", "Multicast interface")
 	port := flag.Int("p", 8080, "Port number for HTTP")
+	chURL := flag.String("c", "", "Channels file URL")
 	flag.Parse()
 	var err error
 	ifi, err = net.InterfaceByName(*ifname)
@@ -361,9 +394,15 @@ func main() {
 		fmt.Printf("No such network interface: %s\n", *ifname)
 		os.Exit(1)
 	}
+	if *chURL != "" {
+		fetchChannels(*chURL)
+	}
 
 	log.Printf("Starting HTTP server on port %d, multicast interface: %s\n", *port, *ifname)
-	channelMap = make(map[string]*ChannelInfo)
-	http.HandleFunc("/rtp/", httpHandler)
+	channels = make(map[string]ChannelInfo)
+	channels["bTV%20HD"] = ChannelInfo{"236.5.22.49:15072", "0dad9bfa732a163baa1c711a22cb84af"}
+	runningChannels = make(map[string]*Channel)
+	http.HandleFunc("/rtp/", rtpHandler)
+	http.HandleFunc("/ch/", chHandler)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
