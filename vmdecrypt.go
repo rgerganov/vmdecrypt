@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/net/ipv4"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -45,6 +46,7 @@ var runningChannelsMu sync.Mutex
 var runningChannels map[string]*Channel
 
 var ifi *net.Interface
+var httpAddr string
 
 type ChannelInfo struct {
 	addr      string
@@ -369,6 +371,15 @@ func chHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func m3uHandler(w http.ResponseWriter, req *http.Request) {
+	io.WriteString(w, "#EXTM3U\n")
+	for k, _ := range channels {
+		chName, _ := url.PathUnescape(k)
+		fmt.Fprintf(w, "#EXTINF:-1, %s\n", chName)
+		fmt.Fprintf(w, "http://%s/ch/%s\n", httpAddr, k)
+	}
+}
+
 func fetchChannels(chURL string) {
 	resp, err := http.Get(chURL)
 	if err != nil {
@@ -390,8 +401,8 @@ func fetchChannels(chURL string) {
 		addr := v[1].(string)
 		switch key := v[2].(type) {
 		case string:
-			// strip "igmp://" from address
 			name = url.PathEscape(name)
+			// strip "igmp://" from address
 			channels[name] = ChannelInfo{addr[7:], key}
 		case float64:
 			// ignore
@@ -402,8 +413,8 @@ func fetchChannels(chURL string) {
 
 func main() {
 	ifname := flag.String("i", "eth0", "Multicast interface")
-	port := flag.Int("p", 8080, "Port number for HTTP")
 	chURL := flag.String("c", "", "Channels file URL")
+	flag.StringVar(&httpAddr, "a", "localhost:8080", "Network address (host:port) for the HTTP server")
 	flag.Parse()
 	var err error
 	ifi, err = net.InterfaceByName(*ifname)
@@ -416,9 +427,10 @@ func main() {
 		fetchChannels(*chURL)
 	}
 
-	log.Printf("Starting HTTP server on port %d, multicast interface: %s\n", *port, *ifname)
+	log.Printf("Starting HTTP server on %s, multicast interface: %s\n", httpAddr, *ifname)
 	runningChannels = make(map[string]*Channel)
 	http.HandleFunc("/rtp/", rtpHandler)
 	http.HandleFunc("/ch/", chHandler)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
+	http.HandleFunc("/channels.m3u", m3uHandler)
+	log.Fatal(http.ListenAndServe(httpAddr, nil))
 }
