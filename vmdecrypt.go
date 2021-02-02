@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -373,7 +374,12 @@ func chHandler(w http.ResponseWriter, req *http.Request) {
 
 func m3uHandler(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, "#EXTM3U\n")
+	keys := make([]string, 0)
 	for k, _ := range channels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		chName, _ := url.PathUnescape(k)
 		fmt.Fprintf(w, "#EXTINF:-1, %s\n", chName)
 		fmt.Fprintf(w, "http://%s/ch/%s\n", httpAddr, k)
