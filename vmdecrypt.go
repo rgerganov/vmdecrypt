@@ -31,8 +31,8 @@ type Channel struct {
 	ecmPid      uint16
 	ecmPidFound bool
 	masterKey   string
-	aes_key_1   []byte
-	aes_key_2   []byte
+	aesKey1     []byte
+	aesKey2     []byte
 	mu          sync.Mutex
 	buf         *ring.Ring
 	c           *sync.Cond
@@ -98,30 +98,30 @@ func (ch *Channel) processECM(pkt []byte) error {
 		return errors.New("Error decrypting ECM")
 	}
 	if pkt[5] == 0x81 {
-		ch.aes_key_1 = ecm[9 : 9+16]
-		ch.aes_key_2 = ecm[25 : 25+16]
+		ch.aesKey1 = ecm[9 : 9+16]
+		ch.aesKey2 = ecm[25 : 25+16]
 	} else {
-		ch.aes_key_2 = ecm[9 : 9+16]
-		ch.aes_key_1 = ecm[25 : 25+16]
+		ch.aesKey2 = ecm[9 : 9+16]
+		ch.aesKey1 = ecm[25 : 25+16]
 	}
 	return nil
 }
 
-func (ch *Channel) decodePacket(pkt []byte) {
-	if ch.aes_key_1 == nil || ch.aes_key_2 == nil {
+func (ch *Channel) decryptPacket(pkt []byte) {
+	if ch.aesKey1 == nil || ch.aesKey2 == nil {
 		return
 	}
 	scramble := (pkt[3] >> 6) & 3
 	if scramble < 2 {
 		return
 	}
-	var aes_key []byte
+	var aesKey []byte
 	if scramble == 2 {
-		aes_key = ch.aes_key_2
+		aesKey = ch.aesKey2
 	} else if scramble == 3 {
-		aes_key = ch.aes_key_1
+		aesKey = ch.aesKey1
 	}
-	cipher, _ := aes.NewCipher([]byte(aes_key))
+	cipher, _ := aes.NewCipher([]byte(aesKey))
 	pkt = pkt[4:]
 	for len(pkt) > 16 {
 		cipher.Decrypt(pkt, pkt)
@@ -194,7 +194,7 @@ func (ch *Channel) processPacket(pkt []byte) error {
 			return err
 		}
 	}
-	ch.decodePacket(pkt)
+	ch.decryptPacket(pkt)
 	ch.addToBuf(pkt)
 	return nil
 	//savePacket(pkt)
