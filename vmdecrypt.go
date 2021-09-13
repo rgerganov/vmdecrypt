@@ -430,7 +430,13 @@ func main() {
 	}
 	channels = make(map[string]ChannelInfo)
 	if *chURL != "" {
-		fetchChannels(*chURL)
+		ticker := time.NewTicker(1 * time.Hour)
+		go func() {
+			for {
+				fetchChannels(*chURL)
+				<-ticker.C
+			}
+		}()
 	}
 
 	log.Printf("Starting HTTP server on %s, multicast interface: %s\n", httpAddr, *ifname)
