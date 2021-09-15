@@ -39,6 +39,7 @@ type Channel struct {
 	done        chan bool
 	ioerr       bool
 	numClients  int
+	http        bool
 }
 
 const RingSize = 64
@@ -57,18 +58,21 @@ type ChannelInfo struct {
 // channel name => ChannelInfo
 var channels map[string]ChannelInfo
 
-func newChannel(masterKey string) *Channel {
-	ch := Channel{firstPkt: true, masterKey: masterKey, numClients: 1}
-	ch.buf = ring.New(RingSize)
-	ch.c = sync.NewCond(&ch.mu)
-	ch.done = make(chan bool)
+func newChannel(masterKey string, http bool) *Channel {
+	ch := Channel{firstPkt: true, masterKey: masterKey, numClients: 1, http: http}
+	if http {
+		ch.buf = ring.New(RingSize)
+		ch.c = sync.NewCond(&ch.mu)
+		ch.done = make(chan bool)
+		ch.http = true
+	}
 	return &ch
 }
 
-func (ch *Channel) parseRTP(pkt []byte) ([]byte, error) {
+func (ch *Channel) parseRTP(pkt []byte) (int, error) {
 	version := pkt[0] >> 6
 	if version != 2 {
-		return nil, fmt.Errorf("Unexpected RTP version %v", version)
+		return 0, fmt.Errorf("Unexpected RTP version %v", version)
 	}
 	hasExtension := (pkt[0] >> 4) & 1
 	seq := binary.BigEndian.Uint16(pkt[2:4])
@@ -84,7 +88,7 @@ func (ch *Channel) parseRTP(pkt []byte) ([]byte, error) {
 	if hasExtension > 0 {
 		extSize = 4 + int(binary.BigEndian.Uint16(pkt[14:16])*4)
 	}
-	return pkt[12+extSize:], nil
+	return 12 + extSize, nil
 }
 
 func (ch *Channel) processECM(pkt []byte) error {
@@ -195,16 +199,19 @@ func (ch *Channel) processPacket(pkt []byte) error {
 		}
 	}
 	ch.decryptPacket(pkt)
-	ch.addToBuf(pkt)
+	if ch.http {
+		ch.addToBuf(pkt)
+	}
 	return nil
 	//savePacket(pkt)
 	//log.Printf("% x\n", pkt)
 }
 
-func (ch *Channel) parseRTPPayload(pkt []byte) error {
-	if len(pkt)%188 != 0 {
-		return fmt.Errorf("Unexpected RTP payload length: %v", len(pkt))
+func (ch *Channel) processRTP(payload []byte, offset int) error {
+	if (len(payload)-offset)%188 != 0 {
+		return fmt.Errorf("Unexpected RTP payload length: %v", len(payload))
 	}
+	pkt := payload[offset:]
 	for len(pkt) > 0 {
 		if err := ch.processPacket(pkt[:188]); err != nil {
 			return err
@@ -248,7 +255,7 @@ func (ch *Channel) closeBuf() {
 	ch.mu.Unlock()
 }
 
-func vmdecrypt(ch *Channel, hostPort string) {
+func decryptHTTP(ch *Channel, hostPort string) {
 	host, _, _ := net.SplitHostPort(hostPort)
 	group := net.ParseIP(host)
 	c, err := net.ListenPacket("udp4", hostPort)
@@ -279,12 +286,13 @@ func vmdecrypt(ch *Channel, hostPort string) {
 			log.Printf("%v @ %v", err, hostPort)
 			goto ioerr
 		}
-		payload, err := ch.parseRTP(pkt[:n])
+		payload := pkt[:n]
+		offset, err := ch.parseRTP(payload)
 		if err != nil {
 			log.Printf("%v @ %v", err, hostPort)
 			goto ioerr
 		}
-		if err := ch.parseRTPPayload(payload); err != nil {
+		if err := ch.processRTP(payload, offset); err != nil {
 			log.Printf("%v @ %v", err, hostPort)
 			goto ioerr
 		}
@@ -303,13 +311,92 @@ ioerr:
 	log.Println("Done @", hostPort)
 }
 
-func channelHandler(chInfo ChannelInfo, w http.ResponseWriter, req *http.Request) {
+func decryptRTP(ch *Channel, hostPort string, dest net.Conn) {
+	host, _, _ := net.SplitHostPort(hostPort)
+	group := net.ParseIP(host)
+	c, err := net.ListenPacket("udp4", hostPort)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	p := ipv4.NewPacketConn(c)
+	if err := p.JoinGroup(ifi, &net.UDPAddr{IP: group}); err != nil {
+		log.Println(err)
+		goto ioerr
+	}
+	defer p.LeaveGroup(ifi, &net.UDPAddr{IP: group})
+
+	log.Println("Start decrypting channel @", hostPort)
+	for {
+		pkt := make([]byte, 1500)
+		p.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, _, err := p.ReadFrom(pkt)
+		if err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
+		payload := pkt[:n]
+		offset, err := ch.parseRTP(payload)
+		if err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
+		if err := ch.processRTP(payload, offset); err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
+		if _, err := dest.Write(payload); err != nil {
+			log.Printf("%v @ %v", err, hostPort)
+			goto ioerr
+		}
+	}
+
+ioerr:
+	log.Println("I/O error, stop decrypting channel @", hostPort)
+	log.Println("Done @", hostPort)
+}
+
+func rtpHandler(w http.ResponseWriter, req *http.Request) {
+	// requestURI should be /rtp/CNN/192.168.1.1:51820
+	parts := strings.Split(req.RequestURI[5:], "/")
+	if len(parts) != 2 {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	chName := parts[0]
+	chInfo, ok := channels[chName];
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	addr := parts[1]
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	dest, err := net.Dial("udp", addr)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	ch := newChannel(chInfo.masterKey, false)
+	go decryptRTP(ch, chInfo.addr, dest)
+}
+
+func chHandler(w http.ResponseWriter, req *http.Request) {
+	chName := req.RequestURI[4:]
+	chInfo, ok := channels[chName]
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
 	runningChannelsMu.Lock()
 	ch, ok := runningChannels[chInfo.addr]
 	if !ok {
-		ch = newChannel(chInfo.masterKey)
+		ch = newChannel(chInfo.masterKey, true)
 		runningChannels[chInfo.addr] = ch
-		go vmdecrypt(ch, chInfo.addr)
+		go decryptHTTP(ch, chInfo.addr)
 	} else {
 		ch.numClients += 1
 	}
@@ -340,36 +427,6 @@ func channelHandler(chInfo ChannelInfo, w http.ResponseWriter, req *http.Request
 		}
 	}
 	runningChannelsMu.Unlock()
-}
-
-func rtpHandler(w http.ResponseWriter, req *http.Request) {
-	// requestURI should be /rtp/236.5.22.49:15072/48a028403963ae6bb8a26ec85677567e
-	parts := strings.Split(req.RequestURI[5:], "/")
-	if len(parts) != 2 {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	addr := parts[0]
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	masterKey := parts[1]
-	if _, err := hex.DecodeString(masterKey); err != nil || len(masterKey) != 32 {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	channelHandler(ChannelInfo{addr, masterKey}, w, req)
-}
-
-func chHandler(w http.ResponseWriter, req *http.Request) {
-	chName := req.RequestURI[4:]
-	if chInfo, ok := channels[chName]; ok {
-		channelHandler(chInfo, w, req)
-	} else {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
 }
 
 func m3uHandler(w http.ResponseWriter, req *http.Request) {
