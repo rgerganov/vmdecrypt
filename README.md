@@ -2,6 +2,8 @@
 
 `vmdecrypt` decrypts multicast MPEG TS streams encrypted with Verimatrix VCAS ([CAID=0x5601](https://en.wikipedia.org/wiki/Conditional_access#Digital_systems)) and serve them on HTTP. You also need the corresponding channel key for each of the encrypted streams. The channel key is an AES key which is used for decrypting the ECM packets. The ECM packets contain 2 AES keys which are used for decrypting the TS packets. The ECM keys are rotated every 10sec. but the channel key is usually rotated every 24h and can be easily shared.
 
+I presented `vmdecrypt` at BSides Sofia, you can watch the recording [here](https://www.youtube.com/watch?v=7JTUQgBlSSU) (in Bulgarian).
+
 # Obtaining channel keys
 
 First you need an STB (or some other device) which can play the encrypted streams. Get root access to the STB and find the RSA key which is used for signing the payload sent to VCAS. Then you can obtain the channel keys with the following protocol:
